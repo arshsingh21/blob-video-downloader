@@ -20,12 +20,16 @@ const CDN_PATH_VIDEO = /\/(files|uploads|content|assets)\/.*\/(source|video|prev
 // MIME types to skip (not video even if URL matched)
 const SKIP_CONTENT_TYPES = /^(text\/html|application\/json|text\/plain|image\/)/i;
 
-// Known DRM-protected CDN domains — raw downloads from these will be encrypted garbage
+// DRM detection: only flag as DRM when the URL is a DASH manifest/segment (in a /dash/ path)
+// OR has an explicit DRM marker. Regular MP4s on cdn*.onlyfans.com are NOT DRM-encrypted.
 const DRM_CDN_PATTERN = /(cdn\d*\.onlyfans\.com|cdn\d*\.fansly\.com|cdn\.drm\.|sec\.cloudfront\.net)/i;
-const DRM_URL_MARKER = /(\/drm\/|\/widevine\/|\/encrypted\/|DRM|cenc|clearkey)/i;
+const DRM_DASH_PATH = /\/dash\//i;   // OnlyFans DASH (CENC) content lives under /dash/
+const DRM_URL_MARKER = /(\/drm\/|\/widevine\/|\/encrypted\/|cenc|clearkey)/i;
 
 // Widevine license server URL patterns
-const LICENSE_URL_PATTERN = /\/(license|widevine|wv|drm\/license|eme|getlicense)/i;
+const LICENSE_URL_PATTERN = /\/(license|widevine|wv|drm\/license|eme|getlicense|drm\/(video|audio|manifest|message))/i;
+// OnlyFans-specific license URL pattern
+const ONLYFANS_LICENSE_PATTERN = /onlyfans\.com\/api.*\/drm\//i;
 
 class Interceptor extends EventEmitter {
   constructor() {
@@ -37,6 +41,17 @@ class Interceptor extends EventEmitter {
 
   get streams() {
     return Array.from(this._detected.values());
+  }
+
+  /** Manually store a license URL (e.g. captured via CDP debugger) */
+  storeLicenseUrl(url, headers = {}) {
+    try {
+      const domain = new URL(url).hostname;
+      const entry = { url, headers, timestamp: Date.now() };
+      this._licenseUrls.set(domain, entry);
+      this._licenseUrls.set(url, entry);
+      this.emit('license-url-detected', { url, headers, domain });
+    } catch (_) {}
   }
 
   /** Get the most recently captured license URL for a given domain (or any) */
@@ -93,19 +108,28 @@ class Interceptor extends EventEmitter {
 
       if (type && !this._detected.has(url)) {
         // Detect if this stream is likely DRM-encrypted
-        const drm = DRM_CDN_PATTERN.test(url) || DRM_URL_MARKER.test(url);
+        const drm = (DRM_CDN_PATTERN.test(url) && DRM_DASH_PATH.test(url)) || DRM_URL_MARKER.test(url);
         const entry = { url, type, headers, drm, timestamp: Date.now() };
         this._detected.set(url, entry);
         this.emit('stream-detected', entry);
       }
 
       // Capture Widevine license server URLs for DRM key retrieval
-      if (LICENSE_URL_PATTERN.test(url) && details.method === 'POST') {
+      // Capture on any method — license URL may appear in GET preflight before POST
+      if (LICENSE_URL_PATTERN.test(url) || ONLYFANS_LICENSE_PATTERN.test(url)) {
         try {
           const domain = new URL(url).hostname;
           this._licenseUrls.set(domain, { url, headers, timestamp: Date.now() });
+          // Also store by full URL path for OnlyFans (license URL is per-media)
+          this._licenseUrls.set(url, { url, headers, timestamp: Date.now() });
           this.emit('license-url-detected', { url, headers, domain });
+          console.log('[DRM] License URL captured:', url);
         } catch (_) {}
+      }
+
+      // Debug: log ALL onlyfans.com API requests so we can identify license URL pattern
+      if (/onlyfans\.com\/api/i.test(url)) {
+        console.log(`[DRM DEBUG] OnlyFans API request [${details.method}]: ${url}`);
       }
 
       callback({ cancel: false });

@@ -86,6 +86,14 @@ window.api.onStreamDetected((stream) => {
   renderStreams();
 });
 
+// Clear stale streams whenever the page navigates (refresh, back/forward, SPA route change)
+// so expired CloudFront tokens don't sit in the sidebar.
+window.api.onStreamsCleared(() => {
+  detectedStreams = [];
+  updateStreamBadge();
+  renderStreams();
+});
+
 function updateStreamBadge() {
   const count = detectedStreams.length;
   streamBadge.textContent = count;
@@ -110,16 +118,37 @@ function renderStreams() {
     const typeLabel = stream.type === 'stream' ? 'HLS / DASH' : stream.type === 'direct' ? 'Direct Video' : 'Segment';
     const drmBadge = stream.drm ? '<span class="drm-badge">DRM</span>' : '';
     const downloadLabel = stream.drm ? 'Download (DRM Decrypt)' : 'Download';
+    const labelHtml = stream.label ? `<div class="stream-label">${escapeHtml(stream.label)}</div>` : '';
 
     card.innerHTML = `
       <div class="stream-type">${typeLabel} ${drmBadge}</div>
+      ${labelHtml}
       ${stream.drm ? '<div class="stream-drm-note">🔓 DRM-protected — will decrypt with Widevine pipeline</div>' : ''}
       <div class="stream-url" title="${escapeHtml(stream.url)}">${escapeHtml(truncateUrl(stream.url))}</div>
       <div class="stream-actions">
         <button class="btn-download">${downloadLabel}</button>
+        <button class="btn-locate">Locate</button>
         <button class="btn-copy-url">Copy URL</button>
       </div>
     `;
+
+    // "Locate" button — highlights the matching video element in the browser until clicked again
+    let locateActive = false;
+    card.querySelector('.btn-locate').addEventListener('click', () => {
+      locateActive = !locateActive;
+      // Clear any other active locate buttons first
+      document.querySelectorAll('.btn-locate.active').forEach(b => {
+        b.classList.remove('active');
+        b.textContent = 'Locate';
+      });
+      if (locateActive) {
+        card.querySelector('.btn-locate').classList.add('active');
+        card.querySelector('.btn-locate').textContent = 'Located ✓';
+        window.api.highlightVideo(stream.url);
+      } else {
+        window.api.unhighlightVideo();
+      }
+    });
 
     card.querySelector('.btn-download').addEventListener('click', () => {
       window.api.download(stream);
@@ -206,20 +235,32 @@ function renderDownloads() {
       timerHtml = `<span class="download-timer">${elapsed}</span>`;
     }
 
+    const showFolderHtml = dl.status === 'complete' && dl.savePath
+      ? `<button class="btn-show-folder" data-path="${escapeHtml(dl.savePath)}">Show in Folder</button>`
+      : '';
+
     card.innerHTML = `
-      <div class="download-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
+      <div class="download-name" title="${escapeHtml(dl.savePath || name)}">${escapeHtml(name)}</div>
       <div class="download-status-row">
         <span class="download-status ${statusClass}">${statusText}</span>
         ${timerHtml}
       </div>
       ${progressHtml}
       ${cancelHtml}
+      ${showFolderHtml}
     `;
 
     const cancelBtn = card.querySelector('.btn-cancel');
     if (cancelBtn) {
       cancelBtn.addEventListener('click', () => {
         window.api.cancelDownload(parseInt(id));
+      });
+    }
+
+    const showBtn = card.querySelector('.btn-show-folder');
+    if (showBtn) {
+      showBtn.addEventListener('click', () => {
+        window.api.showInFolder(showBtn.dataset.path);
       });
     }
 
@@ -316,9 +357,23 @@ btnPick.addEventListener('click', async () => {
     return;
   }
 
-  const src = result.src;
+  // Pick the best non-blob src available
+  let src = result.src;
+  if ((!src || result.isBlob) && result.sources) {
+    src = result.sources.find(s => s && !s.startsWith('blob:')) || src;
+  }
+
   if (!src || src.startsWith('blob:')) {
-    // Video uses MSE/blob — fall back to page-URL yt-dlp download
+    // Video uses MSE/blob — fall back to intercepted streams or page-URL download
+    const interceptedMatch = detectedStreams.find(s =>
+      s.type === 'stream' || (s.type === 'direct' && !s.url.startsWith('blob:'))
+    );
+    if (interceptedMatch) {
+      // An intercepted stream is already in the sidebar — just open it
+      openSidebar();
+      renderStreams();
+      return;
+    }
     const use = confirm(
       `Video found (${result.width}×${result.height}) but uses a protected/blob source.\n\nDownload the page URL with yt-dlp instead?`
     );
@@ -326,9 +381,28 @@ btnPick.addEventListener('click', async () => {
     return;
   }
 
-  // Add as a detected stream so user can download it normally.
-  // Include Referer so download tools behave the same as auto-detected streams.
-  const stream = { url: src, type: 'direct', headers: pageUrlForReferer ? { Referer: pageUrlForReferer } : {} };
+  // Detect DRM: CDN domain alone is NOT enough — must also be a /dash/ path or explicit DRM marker.
+  // Plain cdn*.onlyfans.com MP4s are clear (unencrypted) and download normally.
+  const isDrm = (
+    (/cdn\d*\.onlyfans\.com/i.test(src) || /cdn\d*\.fansly\.com/i.test(src))
+      && /\/dash\//i.test(src)
+  ) || /\/drm\//i.test(src) || /\/widevine\//i.test(src) || /cenc/i.test(src) || /clearkey/i.test(src);
+
+  // Determine stream type
+  const streamType = /\.m3u8|\.mpd|dash|hls/i.test(src) ? 'stream' : 'direct';
+
+  // Build label from video dimensions/duration if available
+  const label = result.width && result.height
+    ? `${result.width}×${result.height}${result.duration && isFinite(result.duration) ? ` · ${Math.round(result.duration)}s` : ''}`
+    : null;
+
+  const stream = {
+    url: src,
+    type: streamType,
+    headers: pageUrlForReferer ? { Referer: pageUrlForReferer } : {},
+    drm: isDrm,
+    label,
+  };
   if (!detectedStreams.some(s => s.url === src)) {
     detectedStreams.push(stream);
     updateStreamBadge();
@@ -346,7 +420,7 @@ btnDrmDismiss.addEventListener('click', () => {
   drmBanner.classList.add('hidden');
 });
 
-// CDM setup button (if present in DOM)
+// CDM setup button
 const btnCdmSetup = document.getElementById('btn-cdm-setup');
 if (btnCdmSetup) {
   btnCdmSetup.addEventListener('click', async () => {
@@ -361,12 +435,40 @@ if (btnCdmSetup) {
     }
   });
 
-  // Check initial CDM status
   window.api.getDrmStatus().then(status => {
     if (status.hasCDM) {
       btnCdmSetup.textContent = 'CDM: Configured ✓';
       btnCdmSetup.classList.add('cdm-ok');
     }
+  });
+}
+
+// ── Download folder settings ──────────────────────────────────────────────────
+const downloadDirDisplay    = document.getElementById('download-dir-display');
+const btnPickDownloadDir    = document.getElementById('btn-pick-download-dir');
+const btnOpenDownloadDir    = document.getElementById('btn-open-download-dir');
+
+function setDownloadDirDisplay(dir) {
+  if (!downloadDirDisplay) return;
+  const short = dir.length > 38 ? '…' + dir.slice(-36) : dir;
+  downloadDirDisplay.textContent = short;
+  downloadDirDisplay.title = dir;
+}
+
+// Load persisted setting on startup
+window.api.getSettings().then(s => setDownloadDirDisplay(s.downloadDir));
+
+if (btnPickDownloadDir) {
+  btnPickDownloadDir.addEventListener('click', async () => {
+    const dir = await window.api.pickDownloadDir();
+    if (dir) setDownloadDirDisplay(dir);
+  });
+}
+
+if (btnOpenDownloadDir) {
+  btnOpenDownloadDir.addEventListener('click', async () => {
+    const s = await window.api.getSettings();
+    if (s.downloadDir) window.api.showInFolder(s.downloadDir);
   });
 }
 

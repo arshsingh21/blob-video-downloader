@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('api', {
 
   // Stream detection
   onStreamDetected: (callback) => ipcRenderer.on('stream-detected', (_e, stream) => callback(stream)),
+  onStreamsCleared: (callback) => ipcRenderer.on('streams-cleared', () => callback()),
   getDetectedStreams: () => ipcRenderer.invoke('get-detected-streams'),
   clearDetectedStreams: () => ipcRenderer.send('clear-detected-streams'),
 
@@ -32,6 +33,13 @@ contextBridge.exposeInMainWorld('api', {
   getCurrentUrl: () => ipcRenderer.invoke('get-current-url'),
   downloadPageUrl: (url) => ipcRenderer.invoke('download-page-url', url),
 
+  // Open file manager with file selected
+  showInFolder: (filePath) => ipcRenderer.send('show-in-folder', filePath),
+
+  // Video element highlighting (hover on stream card → glow in browser)
+  highlightVideo: (url) => ipcRenderer.send('highlight-video', url),
+  unhighlightVideo: () => ipcRenderer.send('unhighlight-video'),
+
   // DRM error notifications
   onDrmError: (callback) => ipcRenderer.on('drm-error', (_e, message) => callback(message)),
 
@@ -42,4 +50,9 @@ contextBridge.exposeInMainWorld('api', {
   getDrmStatus: () => ipcRenderer.invoke('get-drm-status'),
   setCdmDir: (dir) => ipcRenderer.invoke('set-cdm-dir', dir),
   pickCdmDir: () => ipcRenderer.invoke('pick-cdm-dir'),
+
+  // App settings
+  getSettings: () => ipcRenderer.invoke('get-settings'),
+  setSetting: (key, value) => ipcRenderer.invoke('set-setting', key, value),
+  pickDownloadDir: () => ipcRenderer.invoke('pick-download-dir'),
 });

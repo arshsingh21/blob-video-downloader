@@ -1,9 +1,41 @@
-const { app, BrowserWindow, BrowserView, session, ipcMain, globalShortcut, components } = require('electron');
+const { app, BrowserWindow, BrowserView, session, ipcMain, globalShortcut, components, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 const Interceptor = require('./interceptor');
 const Downloader = require('./downloader');
+
+// ── File Logging ──────────────────────────────────────────────────────────────
+const LOG_PATH = path.join(__dirname, 'app.log');
+// Keep last 5 log files (rotate on each launch)
+for (let i = 4; i >= 1; i--) {
+  const from = path.join(__dirname, `app.${i}.log`);
+  const to   = path.join(__dirname, `app.${i + 1}.log`);
+  try { if (fs.existsSync(from)) fs.renameSync(from, to); } catch (_) {}
+}
+try { if (fs.existsSync(LOG_PATH)) fs.renameSync(LOG_PATH, path.join(__dirname, 'app.1.log')); } catch (_) {}
+
+const logStream = fs.createWriteStream(LOG_PATH, { flags: 'w' });
+
+function writeLog(level, args) {
+  const line = `[${new Date().toISOString()}] [${level}] ${args.map(a =>
+    typeof a === 'string' ? a : JSON.stringify(a)
+  ).join(' ')}\n`;
+  logStream.write(line);
+}
+
+const _origLog   = console.log.bind(console);
+const _origWarn  = console.warn.bind(console);
+const _origError = console.error.bind(console);
+
+console.log   = (...args) => { _origLog(...args);   writeLog('INFO',  args); };
+console.warn  = (...args) => { _origWarn(...args);  writeLog('WARN',  args); };
+console.error = (...args) => { _origError(...args); writeLog('ERROR', args); };
+
+process.on('uncaughtException',  (err) => console.error('UncaughtException:', err));
+process.on('unhandledRejection', (err) => console.error('UnhandledRejection:', err));
+
+console.log(`Log file: ${LOG_PATH}`);
 
 let mainWindow;
 let browseView;
@@ -11,6 +43,31 @@ let interceptor;
 let downloader;
 
 const PARTITION = 'persist:browse';
+
+// ── Persistent Settings ───────────────────────────────────────────────────────
+const SETTINGS_PATH = path.join(__dirname, 'settings.json');
+const DEFAULT_SETTINGS = {
+  downloadDir: 'C:\\Users\\arshs\\Downloads\\DL',
+};
+
+function loadSettings() {
+  try {
+    if (fs.existsSync(SETTINGS_PATH)) {
+      return { ...DEFAULT_SETTINGS, ...JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8')) };
+    }
+  } catch (_) {}
+  return { ...DEFAULT_SETTINGS };
+}
+
+function saveSettings(settings) {
+  try {
+    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Failed to save settings:', err);
+  }
+}
+
+let appSettings = loadSettings();
 
 // Fix "Sandbox cannot access executable" on Windows — required for CDM child process
 app.commandLine.appendSwitch('no-sandbox');
@@ -46,6 +103,7 @@ function createWindow() {
 
   mainWindow.setBrowserView(browseView);
   layoutBrowserView();
+  browseView.webContents.loadURL('https://onlyfans.com/purchased');
 
   mainWindow.on('resize', layoutBrowserView);
 
@@ -87,14 +145,51 @@ function createWindow() {
   });
 
   // Set up downloader
-  downloader = new Downloader(mainWindow, interceptor, browseView);
+  downloader = new Downloader(mainWindow, interceptor, browseView, () => appSettings);
 
-  // BrowserView navigation events → sync URL bar
-  browseView.webContents.on('did-navigate', (_e, url) => {
+  // Attach CDP debugger to capture CDM-level license requests that bypass webRequest API
+  try {
+    browseView.webContents.debugger.attach('1.3');
+    browseView.webContents.debugger.sendCommand('Network.enable');
+    browseView.webContents.debugger.on('message', (_e, method, params) => {
+      if (method === 'Network.requestWillBeSent') {
+        const url = params.request.url;
+        const reqMethod = params.request.method;
+        // Log all OnlyFans API calls for debugging
+        if (/onlyfans\.com\/api/i.test(url)) {
+          console.log(`[CDP] OnlyFans API [${reqMethod}]: ${url}`);
+        }
+        // Capture license URLs — POST requests to DRM endpoints
+        if (reqMethod === 'POST' && (
+          /onlyfans\.com.*\/drm\//i.test(url) ||
+          /\/(license|widevine|wv)\b/i.test(url)
+        )) {
+          console.log('[CDP] License URL captured:', url);
+          const headers = params.request.headers || {};
+          interceptor.storeLicenseUrl(url, headers);
+        }
+      }
+    });
+    console.log('CDP debugger attached to BrowserView');
+  } catch (err) {
+    console.warn('CDP debugger attach failed:', err.message);
+  }
+
+  // BrowserView navigation events → sync URL bar + clear stale streams
+  browseView.webContents.on('did-navigate', (_e, url, isMainFrame) => {
     mainWindow.webContents.send('url-changed', url);
+    // Full page navigation (reload, back/forward, new URL) → clear stale stream URLs
+    // so expired CloudFront tokens don't persist in the sidebar.
+    if (isMainFrame) {
+      interceptor.clear();
+      mainWindow.webContents.send('streams-cleared');
+    }
   });
   browseView.webContents.on('did-navigate-in-page', (_e, url) => {
     mainWindow.webContents.send('url-changed', url);
+    // SPA navigation (pushState) — clear streams too since the content changed
+    interceptor.clear();
+    mainWindow.webContents.send('streams-cleared');
   });
   browseView.webContents.on('page-title-updated', (_e, title) => {
     mainWindow.webContents.send('title-changed', title);
@@ -243,13 +338,25 @@ ipcMain.handle('pick-video-element', async () => {
         cleanup();
         const video = findNearestVideo(e.target);
         if (video) {
+          // Collect all possible source URLs from the element
+          const src = video.currentSrc || video.src || '';
+          const sources = [src];
+          // Also check <source> child elements (some players use these instead of src attr)
+          for (const s of video.querySelectorAll('source')) {
+            if (s.src) sources.push(s.src);
+          }
+          // dataset or data-src attributes used by lazy-loading players
+          if (video.dataset && video.dataset.src) sources.push(video.dataset.src);
+
           resolve({
             found: true,
-            src: video.currentSrc || video.src || '',
+            src,
+            sources: sources.filter((s, i, a) => s && a.indexOf(s) === i), // unique non-empty
             width: video.videoWidth,
             height: video.videoHeight,
             duration: video.duration,
             paused: video.paused,
+            isBlob: src.startsWith('blob:'),
           });
         } else {
           resolve({ found: false });
@@ -271,6 +378,83 @@ ipcMain.handle('pick-video-element', async () => {
   } catch {
     return { cancelled: true };
   }
+});
+
+// Highlight the video element in the BrowserView whose src matches the given URL.
+// Falls back to the largest visible video on the page when URL matching fails
+ipcMain.on('show-in-folder', (_e, filePath) => {
+  const { shell } = require('electron');
+  shell.showItemInFolder(filePath);
+});
+
+// (e.g. after a DRM error tears down and recreates the video element).
+ipcMain.on('highlight-video', (_e, url) => {
+  if (!browseView) return;
+  browseView.webContents.executeJavaScript(`
+    (function() {
+      // Clear any existing highlight first
+      document.querySelectorAll('.__vdl_hover_hl').forEach(el => {
+        el.classList.remove('__vdl_hover_hl');
+        el.style.removeProperty('outline');
+        el.style.removeProperty('outline-offset');
+        el.style.removeProperty('box-shadow');
+      });
+
+      const target = ${JSON.stringify(url)};
+      const stem = target ? target.split('?')[0].split('/').pop().replace(/\\.[^.]+$/, '') : '';
+      const videos = Array.from(document.querySelectorAll('video'));
+      if (!videos.length) return;
+
+      // Strategy 1: exact src match
+      let match = videos.find(v => {
+        const src = v.currentSrc || v.src || '';
+        return src && (src === target || (stem && src.includes(stem)));
+      });
+
+      // Strategy 2: closest visible video to the centre of the viewport
+      if (!match) {
+        const cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+        let bestDist = Infinity;
+        for (const v of videos) {
+          const r = v.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          const dx = (r.left + r.width  / 2) - cx;
+          const dy = (r.top  + r.height / 2) - cy;
+          const dist = Math.sqrt(dx*dx + dy*dy);
+          if (dist < bestDist) { bestDist = dist; match = v; }
+        }
+      }
+
+      // Strategy 3: largest video by area
+      if (!match) {
+        match = videos.reduce((best, v) => {
+          const r = v.getBoundingClientRect();
+          const br = best ? best.getBoundingClientRect() : { width: 0, height: 0 };
+          return r.width * r.height > br.width * br.height ? v : best;
+        }, null);
+      }
+
+      if (match) {
+        match.classList.add('__vdl_hover_hl');
+        match.style.outline = '3px solid #5aff8a';
+        match.style.outlineOffset = '3px';
+        match.style.boxShadow = '0 0 0 8px rgba(90,255,138,0.2)';
+        match.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    })()
+  `).catch(() => {});
+});
+
+ipcMain.on('unhighlight-video', () => {
+  if (!browseView) return;
+  browseView.webContents.executeJavaScript(`
+    document.querySelectorAll('.__vdl_hover_hl').forEach(el => {
+      el.classList.remove('__vdl_hover_hl');
+      el.style.removeProperty('outline');
+      el.style.removeProperty('outline-offset');
+      el.style.removeProperty('box-shadow');
+    });
+  `).catch(() => {});
 });
 
 ipcMain.handle('get-current-url', () => {
@@ -320,6 +504,29 @@ ipcMain.handle('pick-cdm-dir', async () => {
   const dir = result.filePaths[0];
   downloader.setCdmDir(dir);
   return { hasCDM: downloader.hasCDM(), cdmDir: dir };
+});
+
+// ── App Settings ─────────────────────────────────────────────────────────────
+
+ipcMain.handle('get-settings', () => appSettings);
+
+ipcMain.handle('set-setting', (_e, key, value) => {
+  appSettings[key] = value;
+  saveSettings(appSettings);
+  return appSettings;
+});
+
+ipcMain.handle('pick-download-dir', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Select Download Folder',
+    defaultPath: appSettings.downloadDir,
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  const dir = result.filePaths[0];
+  appSettings.downloadDir = dir;
+  saveSettings(appSettings);
+  return dir;
 });
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────
