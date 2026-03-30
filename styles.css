@@ -1,0 +1,479 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #0f0f13;
+  color: #e0e0e0;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Nav Bar ──────────────────────────────────────────────────────────────── */
+#nav-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 52px;
+  padding: 0 8px;
+  background: #1a1a22;
+  border-bottom: 1px solid #2a2a38;
+  flex-shrink: 0;
+  -webkit-app-region: no-drag;
+}
+
+.nav-btn {
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: #999;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.nav-btn:hover { background: #2a2a38; color: #e0e0e0; }
+.nav-btn:active { background: #333345; }
+.nav-btn.active { background: #2a2a38; color: #5aff8a; animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+#url-bar-wrap {
+  flex: 1;
+  margin: 0 6px;
+}
+
+#url-input {
+  width: 100%;
+  background: #0f0f13;
+  border: 1px solid #2a2a38;
+  border-radius: 8px;
+  padding: 7px 14px;
+  color: #e0e0e0;
+  font-size: 0.85rem;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+#url-input:focus { border-color: #5a5aff; }
+#url-input::placeholder { color: #555; }
+
+/* Stream badge */
+.streams-btn { position: relative; }
+.badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  background: #5a5aff;
+  color: #fff;
+  font-size: 0.6rem;
+  font-weight: 700;
+  min-width: 16px;
+  height: 16px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
+.badge.hidden { display: none; }
+
+/* Loading indicator on reload button */
+.nav-btn.loading svg {
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* ── Sidebar ──────────────────────────────────────────────────────────────── */
+#sidebar {
+  position: fixed;
+  top: 52px;
+  right: 0;
+  width: 360px;
+  height: calc(100vh - 52px);
+  background: #1a1a22;
+  border-left: 1px solid #2a2a38;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  transition: transform 0.2s ease;
+}
+
+#sidebar.hidden {
+  transform: translateX(100%);
+  pointer-events: none;
+}
+
+#sidebar-header, #downloads-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px;
+  border-bottom: 1px solid #2a2a38;
+}
+
+#sidebar-header h2, #downloads-header h2 {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #888;
+}
+
+#stream-list, #download-list {
+  padding: 8px;
+}
+
+/* Stream card */
+.stream-card {
+  background: #0f0f13;
+  border: 1px solid #2a2a38;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 8px;
+}
+
+.stream-type {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #5a5aff;
+  margin-bottom: 6px;
+}
+
+.stream-url {
+  font-size: 0.75rem;
+  color: #aaa;
+  word-break: break-all;
+  margin-bottom: 10px;
+  max-height: 3em;
+  overflow: hidden;
+}
+
+.drm-badge {
+  display: inline-block;
+  background: #ff5a5a;
+  color: #fff;
+  font-size: 0.55rem;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.05em;
+  vertical-align: middle;
+  margin-left: 4px;
+}
+
+.stream-drm-note {
+  font-size: 0.7rem;
+  color: #ffaa5a;
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  background: rgba(255, 170, 90, 0.08);
+  border-radius: 4px;
+  border-left: 2px solid #ffaa5a;
+}
+
+.stream-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.stream-actions button {
+  flex: 1;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-download {
+  background: #5a5aff;
+  color: #fff;
+}
+.btn-download:hover { background: #4a4ae8; }
+
+.btn-copy-url {
+  background: #2a2a38;
+  color: #bbb;
+}
+.btn-copy-url:hover { background: #333345; }
+
+/* Download card */
+.download-card {
+  background: #0f0f13;
+  border: 1px solid #2a2a38;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 8px;
+}
+
+.download-name {
+  font-size: 0.8rem;
+  color: #e0e0e0;
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.download-status {
+  font-size: 0.7rem;
+  color: #888;
+}
+
+.download-timer {
+  font-size: 0.7rem;
+  color: #666;
+  font-variant-numeric: tabular-nums;
+}
+
+.download-status.error { color: #ff5a5a; }
+.download-status.complete { color: #5aff8a; }
+.download-status.expired { color: #ffaa5a; }
+
+.progress-bar {
+  height: 4px;
+  background: #2a2a38;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: #5a5aff;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.progress-fill.indeterminate {
+  width: 30% !important;
+  animation: indeterminate 1.5s ease-in-out infinite;
+}
+
+@keyframes indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
+.btn-cancel {
+  background: none;
+  border: 1px solid #2a2a38;
+  color: #888;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 0.7rem;
+  cursor: pointer;
+  margin-top: 8px;
+}
+.btn-cancel:hover { border-color: #ff5a5a; color: #ff5a5a; }
+
+/* ── Welcome Screen ───────────────────────────────────────────────────────── */
+#welcome {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+}
+
+#welcome.hidden { display: none; }
+
+.welcome-inner {
+  text-align: center;
+  max-width: 480px;
+}
+
+.welcome-inner h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 8px;
+}
+
+.welcome-inner > p {
+  font-size: 0.9rem;
+  color: #888;
+  margin-bottom: 32px;
+}
+
+.welcome-features {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  text-align: left;
+}
+
+.feature {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.85rem;
+  color: #bbb;
+}
+
+.feature-icon {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1a1a22;
+  border-radius: 8px;
+}
+
+/* ── DRM Banner ──────────────────────────────────────────────────────────── */
+#drm-banner {
+  background: #2a1a00;
+  border-bottom: 1px solid #4a3000;
+  padding: 8px 16px;
+  font-size: 0.8rem;
+  color: #ffaa5a;
+  text-align: center;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+#drm-banner.hidden { display: none; }
+
+#drm-banner #btn-drm-download {
+  background: #ffaa5a;
+  color: #1a1a22;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#drm-banner #btn-drm-download:hover { background: #ffbb77; }
+
+#drm-banner .dismiss {
+  background: none;
+  border: none;
+  color: #ffaa5a;
+  font-size: 1.1rem;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+#drm-banner .dismiss:hover { color: #fff; }
+
+/* ── Page Download Button ────────────────────────────────────────────────── */
+#page-download-section {
+  padding: 12px 8px;
+  border-bottom: 1px solid #2a2a38;
+}
+
+#btn-page-download {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: #2a2a38;
+  color: #e0e0e0;
+  border: 1px solid #3a3a48;
+  border-radius: 8px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+#btn-page-download:hover {
+  background: #333345;
+  border-color: #5a5aff;
+}
+
+/* ── DRM Settings Section ────────────────────────────────────────────────── */
+#drm-settings-section {
+  padding: 12px 8px;
+  border-bottom: 1px solid #2a2a38;
+}
+
+#drm-settings-section h3 {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #888;
+  margin-bottom: 8px;
+}
+
+.btn-cdm {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: #2a2a38;
+  color: #ffaa5a;
+  border: 1px solid #4a3000;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.btn-cdm:hover {
+  background: #333345;
+  border-color: #ffaa5a;
+}
+
+.btn-cdm.cdm-ok {
+  color: #5aff8a;
+  border-color: #1a4a2a;
+}
+
+.btn-cdm.cdm-ok:hover {
+  border-color: #5aff8a;
+}
+
+.drm-help {
+  font-size: 0.68rem;
+  color: #666;
+  margin-top: 6px;
+  line-height: 1.4;
+}
+
+/* ── Tool Warning ─────────────────────────────────────────────────────────── */
+#tool-warning {
+  background: #2a1a00;
+  border-bottom: 1px solid #4a3000;
+  padding: 8px 16px;
+  font-size: 0.8rem;
+  color: #ffaa5a;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+#tool-warning.hidden { display: none; }

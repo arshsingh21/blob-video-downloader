@@ -1,0 +1,13 @@
+{
+  "name": "blob-video-downloader",
+  "version": "1.0.0",
+  "description": "Electron browser with built-in video stream detection and download",
+  "main": "main.js",
+  "scripts": {
+    "start": "node launch.js",
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "devDependencies": {
+    "electron": "https://github.com/castlabs/electron-releases#v33.4.11+wvcus"
+  }
+}
