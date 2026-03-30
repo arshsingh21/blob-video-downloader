@@ -24,7 +24,7 @@ def main():
 
     try:
         from pywidevine.cdm import Cdm
-        from pywidevine.device import Device
+        from pywidevine.device import Device, DeviceTypes
         from pywidevine.pssh import PSSH
     except ImportError:
         print('Error: pywidevine not installed. Run: pip install pywidevine', file=sys.stderr)
@@ -38,12 +38,20 @@ def main():
 
     headers = json.loads(args.headers)
 
+    # Debug: show which auth headers were received (without exposing full cookie values)
+    auth_keys = [k for k in headers if k.lower() in ('cookie', 'authorization', 'sign', 'time', 'x-bc')]
+    print(f'[drm-keygen] License URL: {args.license_url}', file=sys.stderr)
+    print(f'[drm-keygen] Auth headers present: {auth_keys}', file=sys.stderr)
+    if 'Cookie' in headers:
+        print(f'[drm-keygen] Cookie length: {len(headers["Cookie"])} chars', file=sys.stderr)
+
     # Load device from raw client_id_blob + private_key files
     device = Device(
         client_id=open(args.client_id, 'rb').read(),
-        private_key=open(args.private_key, 'rb').read(),
-        type_=Device.Types.ANDROID,
+        private_key=open(args.private_key, 'rb').read(),  # accepts both raw and PEM format
+        type_=DeviceTypes.ANDROID,
         security_level=3,
+        flags={},
     )
 
     cdm = Cdm.from_device(device)
@@ -60,6 +68,12 @@ def main():
             headers=headers,
             timeout=30,
         )
+        if resp.status_code == 401:
+            raise Exception(
+                f'License server returned 401 Unauthorized. '
+                f'Auth headers sent: {list(headers.keys())}. '
+                f'Response: {resp.text[:200]}'
+            )
         resp.raise_for_status()
 
         cdm.parse_license(session_id, resp.content)

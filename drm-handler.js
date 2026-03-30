@@ -16,18 +16,30 @@ const os = require('os');
 const WIDEVINE_SYSTEM_ID = 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed';
 
 class DrmHandler {
-  constructor(cdmDir) {
+  constructor(cdmDir, electronSession) {
     // cdmDir: directory containing device_client_id_blob + device_private_key
     this.cdmDir = cdmDir || null;
     this._pyScriptPath = path.join(__dirname, 'drm-keygen.py');
+    this._session = electronSession || null; // Electron session for cookie access
+  }
+
+  /** Resolve CDM file path, accepting multiple naming conventions */
+  _resolveCdmFile(type) {
+    // type: 'blob' or 'key'
+    const names = type === 'blob'
+      ? ['device_client_id_blob', 'client_id.bin', 'client_id']
+      : ['device_private_key', 'private_key.pem', 'private_key'];
+    for (const name of names) {
+      const p = path.join(this.cdmDir, name);
+      if (fs.existsSync(p)) return p;
+    }
+    return null;
   }
 
   /** Check if local CDM files are configured */
   hasCDM() {
     if (!this.cdmDir) return false;
-    const blobPath = path.join(this.cdmDir, 'device_client_id_blob');
-    const keyPath = path.join(this.cdmDir, 'device_private_key');
-    return fs.existsSync(blobPath) && fs.existsSync(keyPath);
+    return !!this._resolveCdmFile('blob') && !!this._resolveCdmFile('key');
   }
 
   /** Fetch an MPD manifest over HTTP(S) */
@@ -98,6 +110,21 @@ class DrmHandler {
     const wvMatch = mpdXml.match(/<(?:widevine:)?license[^>]*(?:src|url)\s*=\s*"([^"]+)"/i);
     if (wvMatch) return wvMatch[1].trim();
 
+    // licenseAcquisitionURL attribute inside ContentProtection
+    const lacMatch = mpdXml.match(/licenseAcquisitionURL\s*=\s*"([^"]+)"/i);
+    if (lacMatch) return lacMatch[1].trim();
+
+    // Any https URL inside a Widevine ContentProtection block
+    const cpBlock = mpdXml.match(/<ContentProtection[^>]*edef8ba9-79d6-4ace-a3c8-27dcd51d21ed[^>]*>([\s\S]*?)<\/ContentProtection>/i);
+    if (cpBlock) {
+      const urlInBlock = cpBlock[1].match(/https?:\/\/[^\s"'<>]+/i);
+      if (urlInBlock) return urlInBlock[0].trim();
+    }
+
+    // Last resort: any URL in the MPD that looks like a license endpoint
+    const anyLicense = mpdXml.match(/https?:\/\/[^\s"'<>]*\/(license|drm|widevine|wv)[^\s"'<>]*/i);
+    if (anyLicense) return anyLicense[0].trim();
+
     return null;
   }
 
@@ -110,8 +137,8 @@ class DrmHandler {
       throw new Error('CDM files not configured. Place device_client_id_blob and device_private_key in the CDM directory.');
     }
 
-    const blobPath = path.join(this.cdmDir, 'device_client_id_blob');
-    const keyPath = path.join(this.cdmDir, 'device_private_key');
+    const blobPath = this._resolveCdmFile('blob');
+    const keyPath = this._resolveCdmFile('key');
 
     // Build headers JSON for the Python script
     const headersJson = JSON.stringify(headers);
@@ -163,7 +190,13 @@ class DrmHandler {
    * Returns array of { kid, key } objects.
    */
   async getDecryptionKeyExternal(pssh, licenseUrl, headers = {}) {
-    // Use CDRM Project API
+    // External fallback — no CDM files needed but requires a public API service.
+    // cdrm-project.com API endpoint (may change over time):
+    const endpoints = [
+      { url: 'https://cdrm-project.com/wv', method: 'POST' },
+      { url: 'https://cdrm-project.com/api/wv', method: 'POST' },
+    ];
+
     const postData = JSON.stringify({
       PSSH: pssh,
       License_URL: licenseUrl,
@@ -174,8 +207,24 @@ class DrmHandler {
       Proxy: '',
     });
 
+    let lastError;
+    for (const endpoint of endpoints) {
+      try {
+        const keys = await this._postCDRM(endpoint.url, postData);
+        return keys;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw new Error(
+      `External DRM service unavailable (${lastError?.message}). ` +
+      'Configure CDM files via Settings to use local decryption instead.'
+    );
+  }
+
+  _postCDRM(url, postData) {
     return new Promise((resolve, reject) => {
-      const req = https.request('https://cdrm-project.com/wv', {
+      const req = https.request(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -186,7 +235,7 @@ class DrmHandler {
         res.on('data', (chunk) => { body += chunk; });
         res.on('end', () => {
           if (res.statusCode !== 200) {
-            reject(new Error(`CDRM API returned HTTP ${res.statusCode}: ${body}`));
+            reject(new Error(`CDRM API returned HTTP ${res.statusCode}`));
             return;
           }
           try {
@@ -197,7 +246,7 @@ class DrmHandler {
             }
             resolve(keys);
           } catch (e) {
-            reject(new Error(`Failed to parse CDRM response: ${body}`));
+            reject(new Error(`Failed to parse CDRM response: ${body.slice(0, 100)}`));
           }
         });
         res.on('error', reject);
@@ -212,7 +261,7 @@ class DrmHandler {
 
   /**
    * Try to get decryption key — local CDM first, then external service fallback.
-   * Returns the first CONTENT type key as "kid:key" hex string for mp4decrypt.
+   * Returns ALL content keys (DASH video/audio tracks each have their own KID).
    */
   async getDecryptionKey(pssh, licenseUrl, headers = {}) {
     let keys;
@@ -232,12 +281,20 @@ class DrmHandler {
       method = 'external';
     }
 
-    // Find the CONTENT key (not SIGNING key)
-    const contentKey = keys.find(k => k.type === 'CONTENT') || keys[0];
+    // Collect ALL CONTENT keys — DASH streams have separate KIDs for video and audio
+    const contentKeys = keys.filter(k => k.type === 'CONTENT');
+    if (contentKeys.length === 0) contentKeys.push(keys[0]); // fallback if no typed keys
+
+    const decryptionKeys = contentKeys.map(k => `${k.kid}:${k.key}`);
+
+    console.log(`[DRM] Got ${contentKeys.length} content key(s) via ${method}:`);
+    for (const k of contentKeys) {
+      console.log(`  KID=${k.kid}  KEY=${k.key}  TYPE=${k.type}`);
+    }
+
     return {
-      kid: contentKey.kid,
-      key: contentKey.key,
-      decryptionKey: `${contentKey.kid}:${contentKey.key}`,
+      decryptionKeys,            // array of "kid:key" strings for mp4decrypt
+      decryptionKey: decryptionKeys[0], // backward compat single key
       method,
       allKeys: keys,
     };
@@ -247,81 +304,164 @@ class DrmHandler {
    * Download encrypted DASH content and decrypt with mp4decrypt.
    * Uses yt-dlp to download the encrypted segments, then mp4decrypt to decrypt.
    */
-  async downloadAndDecrypt({ mpdUrl, decryptionKey, headers, savePath, onProgress }) {
-    const tempEncrypted = savePath + '.encrypted.mp4';
-    const tempDecrypted = savePath + '.decrypted.mp4';
+  async downloadAndDecrypt({ mpdUrl, decryptionKey, decryptionKeys, headers, savePath, onProgress }) {
+    if (!decryptionKeys) decryptionKeys = decryptionKey ? [decryptionKey] : [];
+
+    const tempVideoEnc = savePath + '.video.enc.mp4';
+    const tempAudioEnc = savePath + '.audio.enc.mp4';
+    const tempVideoDec = savePath + '.video.dec.mp4';
+    const tempAudioDec = savePath + '.audio.dec.mp4';
 
     try {
-      // Step 1: Download encrypted content with yt-dlp
+      // Step 1: Download video and audio tracks separately (encrypted).
+      // yt-dlp won't merge when --allow-unplayable-formats is set, so we download
+      // each track individually to preserve CENC tenc/pssh boxes for mp4decrypt.
       if (onProgress) onProgress({ step: 'downloading', percent: null });
-      await this._downloadEncrypted(mpdUrl, headers, tempEncrypted, onProgress);
+      console.log(`[DRM] Downloading encrypted video track from: ${mpdUrl}`);
+      await this._downloadEncrypted(mpdUrl, headers, tempVideoEnc, 'bestvideo', onProgress);
+      console.log(`[DRM] Video enc: ${fs.existsSync(tempVideoEnc) ? fs.statSync(tempVideoEnc).size : 0} bytes`);
 
-      // Step 2: Decrypt with mp4decrypt
+      console.log(`[DRM] Downloading encrypted audio track`);
+      await this._downloadEncrypted(mpdUrl, headers, tempAudioEnc, 'bestaudio', null);
+      console.log(`[DRM] Audio enc: ${fs.existsSync(tempAudioEnc) ? fs.statSync(tempAudioEnc).size : 0} bytes`);
+
+      // Step 2: Inspect actual KIDs in each file, build complete key list
+      const videoKids = await this._inspectKids(tempVideoEnc);
+      const audioKids = await this._inspectKids(tempAudioEnc);
+      console.log(`[DRM] Video KIDs in file: ${videoKids.join(', ') || '(none)'}`);
+      console.log(`[DRM] Audio KIDs in file: ${audioKids.join(', ') || '(none)'}`);
+      console.log(`[DRM] Keys from license:  ${decryptionKeys.join(', ')}`);
+
+      const allKeys = [...decryptionKeys];
+      for (const kid of [...new Set([...videoKids, ...audioKids])]) {
+        if (!decryptionKeys.some(k => k.toLowerCase().startsWith(kid.toLowerCase()))) {
+          allKeys.push(`${kid}:${decryptionKeys[0].split(':')[1]}`);
+          console.log(`[DRM] Fallback key added for unmatched KID: ${kid}`);
+        }
+      }
+
+      // Step 3: Decrypt each track
       if (onProgress) onProgress({ step: 'decrypting', percent: null });
-      await this._decrypt(tempEncrypted, tempDecrypted, decryptionKey);
+      await this._decrypt(tempVideoEnc, tempVideoDec, allKeys);
+      await this._decrypt(tempAudioEnc, tempAudioDec, allKeys);
+      console.log(`[DRM] Decrypted video: ${fs.existsSync(tempVideoDec) ? fs.statSync(tempVideoDec).size : 0} bytes`);
+      console.log(`[DRM] Decrypted audio: ${fs.existsSync(tempAudioDec) ? fs.statSync(tempAudioDec).size : 0} bytes`);
 
-      // Step 3: Remux to final output (fix container if needed)
+      // Step 4: Mux decrypted video + audio into final output
       if (onProgress) onProgress({ step: 'remuxing', percent: null });
-      await this._remux(tempDecrypted, savePath);
+      await this._muxVideoAudio(tempVideoDec, tempAudioDec, savePath);
+      console.log(`[DRM] Final: ${fs.existsSync(savePath) ? fs.statSync(savePath).size : 0} bytes → ${savePath}`);
 
       return true;
     } finally {
-      // Clean up temp files
-      this._cleanupFile(tempEncrypted);
-      this._cleanupFile(tempDecrypted);
+      this._cleanupFile(tempVideoEnc);
+      this._cleanupFile(tempAudioEnc);
+      this._cleanupFile(tempVideoDec);
+      this._cleanupFile(tempAudioDec);
     }
   }
 
-  /** Download encrypted DASH/HLS content using ffmpeg -c copy (preserves encryption) */
-  async _downloadEncrypted(mpdUrl, headers, outputPath, onProgress) {
-    const args = ['-y'];
+  /**
+   * Download one encrypted DASH track using yt-dlp --allow-unplayable-formats.
+   * format: yt-dlp format selector e.g. 'bestvideo', 'bestaudio', 'best'
+   * This preserves CENC encryption boxes (tenc/pssh) that mp4decrypt needs.
+   */
+  async _downloadEncrypted(mpdUrl, headers, outputPath, format = 'bestvideo', onProgress) {
+    // Write a temporary cookie file for yt-dlp using Electron session cookies
+    const cookiePath = outputPath + '.cookies.txt';
+    const cookieLines = ['# Netscape HTTP Cookie File'];
 
-    const headerParts = [];
-    for (const key of ['Referer', 'User-Agent', 'Cookie', 'Origin']) {
-      if (headers[key]) headerParts.push(`${key}: ${headers[key]}`);
+    if (this._session) {
+      // Pull all cookies directly from Electron's session store (most reliable)
+      try {
+        const allCookies = await this._session.cookies.get({});
+        console.log(`[DRM] Writing ${allCookies.length} session cookies to cookie file`);
+        for (const c of allCookies) {
+          if (c.name.includes('\t') || c.value.includes('\t') || c.value.includes('\n')) continue;
+          const domain = c.domain.startsWith('.') ? c.domain : '.' + c.domain;
+          const flag = 'TRUE';
+          const cookiePath2 = c.path || '/';
+          const secure = c.secure ? 'TRUE' : 'FALSE';
+          const expiry = c.expirationDate ? Math.floor(c.expirationDate) : 0;
+          cookieLines.push(`${domain}\t${flag}\t${cookiePath2}\t${secure}\t${expiry}\t${c.name}\t${c.value}`);
+        }
+      } catch (err) {
+        console.warn('[DRM] Could not read session cookies:', err.message);
+      }
+    } else if (headers['Cookie']) {
+      // Fallback: parse Cookie header string into Netscape format
+      const pairs = headers['Cookie'].split(';').map(s => s.trim()).filter(Boolean);
+      for (const pair of pairs) {
+        const eq = pair.indexOf('=');
+        if (eq === -1) continue;
+        const name = pair.slice(0, eq).trim();
+        const value = pair.slice(eq + 1).trim();
+        cookieLines.push(`.onlyfans.com\tTRUE\t/\tFALSE\t0\t${name}\t${value}`);
+        cookieLines.push(`.cdn3.onlyfans.com\tTRUE\t/\tFALSE\t0\t${name}\t${value}`);
+        cookieLines.push(`.cdn2.onlyfans.com\tTRUE\t/\tFALSE\t0\t${name}\t${value}`);
+      }
     }
-    if (headerParts.length > 0) {
-      args.push('-headers', headerParts.join('\r\n') + '\r\n');
-    }
+    fs.writeFileSync(cookiePath, cookieLines.join('\n') + '\n', 'utf-8');
 
-    // Download without decryption — just copy the encrypted streams
-    args.push('-i', mpdUrl, '-c', 'copy', '-y', outputPath);
+    const args = [
+      '--allow-unplayable-formats',   // download encrypted content as-is (preserves CENC boxes)
+      '--no-check-certificates',
+      '--no-continue',                // never resume partial downloads (avoids 416 errors)
+      '--no-part',                    // write directly to output, no .part file
+      '-f', format,                   // caller specifies track: bestvideo / bestaudio
+      '--cookies', cookiePath,
+      '-o', outputPath,
+    ];
+
+    if (headers['Referer']) args.push('--add-header', `Referer:${headers['Referer']}`);
+    if (headers['User-Agent']) args.push('--add-header', `User-Agent:${headers['User-Agent']}`);
+
+    args.push(mpdUrl);
+
+    console.log(`[DRM] yt-dlp download args: ${args.join(' ')}`);
 
     return new Promise((resolve, reject) => {
-      const proc = spawn('ffmpeg', args, { shell: false });
+      const proc = spawn('yt-dlp', args, { shell: false });
 
-      let stderr = '';
-      proc.stderr.on('data', (data) => {
-        stderr += data.toString();
-        // Try to parse progress
-        const timeMatch = stderr.match(/time=(\d{2}:\d{2}:\d{2}\.\d+)/);
-        if (timeMatch && onProgress) {
-          onProgress({ step: 'downloading', timeStr: timeMatch[1] });
-          stderr = ''; // reset buffer
+      let output = '';
+      proc.stdout.on('data', (data) => {
+        output += data.toString();
+        const pctMatch = data.toString().match(/([\d.]+)%/);
+        if (pctMatch && onProgress) {
+          onProgress({ step: 'downloading', percent: Math.min(99, Math.round(parseFloat(pctMatch[1]))) });
         }
       });
+      proc.stderr.on('data', (data) => { output += data.toString(); });
 
       proc.on('close', (code) => {
+        try { fs.unlinkSync(cookiePath); } catch (_) {}
         if (code === 0) {
           resolve();
-        } else if (stderr.includes('403') || stderr.includes('Server returned 403')) {
+        } else if (/403|410|expired/i.test(output)) {
           reject(Object.assign(new Error('Stream token expired'), { expired: true }));
         } else {
-          reject(new Error(`ffmpeg download failed (code ${code}): ${stderr.slice(-300)}`));
+          reject(new Error(`yt-dlp encrypted download failed (code ${code}): ${output.slice(-400)}`));
         }
       });
 
       proc.on('error', (err) => {
-        if (err.code === 'ENOENT') reject(new Error('ffmpeg not found on PATH'));
+        try { fs.unlinkSync(cookiePath); } catch (_) {}
+        if (err.code === 'ENOENT') reject(new Error('yt-dlp not found on PATH'));
         else reject(err);
       });
     });
   }
 
-  /** Decrypt with mp4decrypt using the content key */
+  /** Decrypt with mp4decrypt using one or more content keys */
   async _decrypt(inputPath, outputPath, decryptionKey) {
-    // decryptionKey format: "kid:key" (both hex)
-    const args = ['--key', decryptionKey, inputPath, outputPath];
+    // decryptionKey: either a single "kid:key" string or an array of them
+    const keyList = Array.isArray(decryptionKey) ? decryptionKey : [decryptionKey];
+    const args = [];
+    for (const kv of keyList) {
+      args.push('--key', kv);
+    }
+    args.push(inputPath, outputPath);
+    console.log(`[DRM] mp4decrypt args: ${args.join(' ')}`);
 
     return new Promise((resolve, reject) => {
       const proc = spawn('mp4decrypt', args, { shell: false });
@@ -329,11 +469,16 @@ class DrmHandler {
       let stderr = '';
       proc.stderr.on('data', (d) => { stderr += d.toString(); });
 
+      let stdout = '';
+      proc.stdout.on('data', (d) => { stdout += d.toString(); });
+
       proc.on('close', (code) => {
+        if (stdout) console.log(`[DRM] mp4decrypt stdout: ${stdout}`);
+        if (stderr) console.log(`[DRM] mp4decrypt stderr: ${stderr}`);
         if (code === 0) {
           resolve();
         } else {
-          reject(new Error(`mp4decrypt failed (code ${code}): ${stderr}`));
+          reject(new Error(`mp4decrypt failed (code ${code}): ${stderr || stdout}`));
         }
       });
 
@@ -343,6 +488,26 @@ class DrmHandler {
         } else {
           reject(err);
         }
+      });
+    });
+  }
+
+  /** Mux a decrypted video file and a decrypted audio file into one MP4 */
+  async _muxVideoAudio(videoPath, audioPath, outputPath) {
+    const args = ['-y', '-i', videoPath, '-i', audioPath, '-c', 'copy', outputPath];
+    return new Promise((resolve, reject) => {
+      const proc = spawn('ffmpeg', args, { shell: false });
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', (code) => {
+        if (code === 0) { resolve(); return; }
+        // If mux failed, try video-only as a fallback (better than nothing)
+        console.warn(`[DRM] ffmpeg mux failed (code ${code}), copying video-only: ${stderr.slice(-200)}`);
+        try { fs.copyFileSync(videoPath, outputPath); resolve(); } catch (e) { reject(e); }
+      });
+      proc.on('error', (err) => {
+        // ffmpeg not found — just copy video track
+        try { fs.copyFileSync(videoPath, outputPath); resolve(); } catch (e) { reject(err); }
       });
     });
   }
@@ -421,6 +586,99 @@ class DrmHandler {
       keys.push({ kid: match[1].toLowerCase(), key: match[2].toLowerCase(), type: 'CONTENT' });
     }
     return keys;
+  }
+
+  /**
+   * Extract actual KIDs from a downloaded encrypted MP4 using mp4info (Bento4).
+   * Returns array of KID hex strings found in the file's CENC protection boxes.
+   */
+  async _inspectKids(filePath) {
+    return new Promise((resolve) => {
+      const proc = spawn('mp4info', ['--format', 'json', filePath], { shell: false, timeout: 10000 });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', d => { stdout += d.toString(); });
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('error', () => resolve([]));
+      proc.on('close', () => {
+        const kids = new Set();
+        try {
+          const info = JSON.parse(stdout);
+          const tracks = info.tracks || [];
+          for (const track of tracks) {
+            const prot = track.sample_description?.protection_scheme;
+            if (prot) {
+              // KID may be in different locations depending on mp4info version
+              const kid = prot.kid || prot.default_kid || prot.default_KID;
+              if (kid) kids.add(kid.replace(/-/g, '').toLowerCase());
+            }
+            // Also check 'protection' array
+            const protList = track.protection || track.sample_description?.protection || [];
+            for (const p of (Array.isArray(protList) ? protList : [])) {
+              const kid = p.kid || p.default_kid;
+              if (kid) kids.add(kid.replace(/-/g, '').toLowerCase());
+            }
+          }
+        } catch (_) {
+          // mp4info not available or different format — fall back to raw binary scan
+          const kidSet = this._scanKidsFromBinary(filePath);
+          for (const k of kidSet) kids.add(k);
+        }
+        resolve([...kids]);
+      });
+    });
+  }
+
+  /**
+   * Fallback: scan the raw binary of an MP4 for KID bytes by looking for PSSH/tenc boxes.
+   * Reads first 2MB (init segments are always at the start).
+   */
+  _scanKidsFromBinary(filePath) {
+    const kids = new Set();
+    try {
+      const SCAN_BYTES = 2 * 1024 * 1024;
+      const buf = Buffer.alloc(SCAN_BYTES);
+      const fd = fs.openSync(filePath, 'r');
+      const bytesRead = fs.readSync(fd, buf, 0, SCAN_BYTES, 0);
+      fs.closeSync(fd);
+      const data = buf.slice(0, bytesRead);
+
+      // Search for Widevine PSSH system ID: edef8ba979d64acea3c827dcd51d21ed
+      const wvId = Buffer.from('edef8ba979d64acea3c827dcd51d21ed', 'hex');
+      let pos = 0;
+      while (pos < data.length - 32) {
+        const idx = data.indexOf(wvId, pos);
+        if (idx === -1) break;
+        // After system ID (16 bytes) comes data size (4 bytes) then PSSH data
+        // KIDs are in the Widevine PSSH protobuf — too complex to parse here
+        // Instead, look for 'tenc' box which has the default KID
+        pos = idx + 16;
+      }
+
+      // Search for 'tenc' box (Track Encryption Box) — contains default KID at offset 8
+      const tenc = Buffer.from('74656e63', 'hex'); // 'tenc'
+      pos = 0;
+      while (pos < data.length - 24) {
+        const idx = data.indexOf(tenc, pos);
+        if (idx === -1) break;
+        // tenc box: [4 bytes size][4 bytes 'tenc'][1 version][3 flags][1 reserved][1 per_sample_iv_size][16 bytes KID]
+        // or version 1: [4 size][4 tenc][1 ver][3 flags][4 default_crypt_byte_block+default_skip_byte_block][1 default_per_sample_iv_size][16 KID]
+        const kidOffset = idx + 8 + 4; // skip version+flags+reserved+per_sample_iv_size
+        if (kidOffset + 16 <= data.length) {
+          const kidBuf = data.slice(kidOffset, kidOffset + 16);
+          const kidHex = kidBuf.toString('hex');
+          // Sanity check: skip all-zeros or all-FF
+          if (!/^0{32}$/.test(kidHex) && !/^f{32}$/i.test(kidHex)) {
+            kids.add(kidHex);
+            console.log(`[DRM] Found KID in tenc box at offset ${kidOffset}: ${kidHex}`);
+          }
+        }
+        pos = idx + 4;
+      }
+    } catch (err) {
+      console.log(`[DRM] Binary KID scan error: ${err.message}`);
+    }
+    return kids;
   }
 
   _cleanupFile(filePath) {

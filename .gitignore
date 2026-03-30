@@ -1,8 +1,11 @@
 node_modules/
 .DS_Store
 *.log
+app.*.log
+settings.json
 .env
 dist/
 out/
 .gemini/
 .claude/
+cdm/

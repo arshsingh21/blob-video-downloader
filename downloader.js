@@ -1,5 +1,5 @@
 const { spawn, execSync } = require('child_process');
-const { dialog, session } = require('electron');
+const { app, dialog, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -22,22 +22,23 @@ const FFMPEG_PATH = 'ffmpeg';
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 2000;
 
-// Default CDM directory — user can configure via settings
-const DEFAULT_CDM_DIR = path.join(os.homedir(), '.blob-video-downloader', 'cdm');
+// Default CDM directory — project-local cdm/ folder, auto-detected on startup
+const DEFAULT_CDM_DIR = path.join(__dirname, 'cdm');
 
 class Downloader {
-  constructor(mainWindow, interceptor, browseView) {
+  constructor(mainWindow, interceptor, browseView, getSettings) {
     this.mainWindow = mainWindow;
     this.interceptor = interceptor;
     this.browseView = browseView;
     this.active = new Map(); // id -> { process, cancel }
     this._nextId = 1;
-    this.drmHandler = new DrmHandler(DEFAULT_CDM_DIR);
+    this._getSettings = getSettings || (() => ({}));
+    this.drmHandler = new DrmHandler(DEFAULT_CDM_DIR, session.fromPartition('persist:browse'));
   }
 
   /** Update CDM directory path */
   setCdmDir(dir) {
-    this.drmHandler = new DrmHandler(dir);
+    this.drmHandler = new DrmHandler(dir, session.fromPartition('persist:browse'));
   }
 
   /** Check if CDM files are present */
@@ -119,20 +120,43 @@ class Downloader {
   async download(streamInfo) {
     const { url, type, headers, drm } = streamInfo;
 
-    // Ask user where to save
-    const defaultName = type === 'stream' ? 'video.mp4' : path.basename(new URL(url).pathname) || 'video.mp4';
-    const result = await dialog.showSaveDialog(this.mainWindow, {
-      title: 'Save Video',
-      defaultPath: defaultName,
-      filters: [
-        { name: 'Video', extensions: ['mp4', 'mkv', 'webm', 'mov'] },
-        { name: 'Audio', extensions: ['mp3', 'aac', 'opus'] },
-        { name: 'All Files', extensions: ['*'] },
-      ],
-    });
-
-    if (result.canceled || !result.filePath) return null;
-    const savePath = result.filePath;
+    // For DRM downloads skip the blocking save dialog — start immediately to avoid
+    // CloudFront signed URL expiry (tokens last ~3-5 min, dialog eats that window).
+    // Auto-name the file and save to configured download dir; user can rename after.
+    let savePath;
+    if (drm) {
+      const stem = (() => {
+        try {
+          const p = new URL(url).pathname;
+          const base = p.split('/').pop().replace(/\.[^.]+$/, '') || 'video';
+          return base;
+        } catch { return 'video'; }
+      })();
+      const settings = this._getSettings();
+      const downloadsDir = settings.downloadDir || app.getPath('downloads');
+      // Ensure the directory exists
+      if (!fs.existsSync(downloadsDir)) fs.mkdirSync(downloadsDir, { recursive: true });
+      // Find a non-colliding filename
+      let candidate = path.join(downloadsDir, `${stem}.mp4`);
+      let n = 1;
+      while (fs.existsSync(candidate)) {
+        candidate = path.join(downloadsDir, `${stem} (${n++}).mp4`);
+      }
+      savePath = candidate;
+    } else {
+      const defaultName = type === 'stream' ? 'video.mp4' : path.basename(new URL(url).pathname) || 'video.mp4';
+      const result = await dialog.showSaveDialog(this.mainWindow, {
+        title: 'Save Video',
+        defaultPath: defaultName,
+        filters: [
+          { name: 'Video', extensions: ['mp4', 'mkv', 'webm', 'mov'] },
+          { name: 'Audio', extensions: ['mp3', 'aac', 'opus'] },
+          { name: 'All Files', extensions: ['*'] },
+        ],
+      });
+      if (result.canceled || !result.filePath) return null;
+      savePath = result.filePath;
+    }
 
     const id = this._nextId++;
     this._sendProgress(id, { status: 'starting', url, savePath, percent: null });
@@ -245,18 +269,31 @@ class Downloader {
 
     // Step 3: Find license server URL
     let licenseUrl = this.drmHandler.extractLicenseUrl(mpdXml);
-    if (!licenseUrl && this.interceptor) {
-      // Try to get from intercepted license requests
+    // licenseHeaders: used specifically for the license POST — may differ from CDN stream headers
+    let licenseHeaders = { ...headers };
+
+    if (this.interceptor) {
       const licenseEntry = this.interceptor.getLicenseUrl();
       if (licenseEntry) {
-        licenseUrl = licenseEntry.url;
-        // Merge license request headers (they may include auth tokens)
-        if (licenseEntry.headers) {
-          for (const [k, v] of Object.entries(licenseEntry.headers)) {
-            if (!headers[k]) headers[k] = v;
-          }
+        if (!licenseUrl) licenseUrl = licenseEntry.url;
+        // Use the headers the browser actually sent for the license request —
+        // these contain the real auth tokens (cookies, sign, time, etc.)
+        if (licenseEntry.headers && Object.keys(licenseEntry.headers).length > 0) {
+          licenseHeaders = { ...licenseEntry.headers };
         }
       }
+    }
+
+    // Enrich license headers with session cookies for the license server's domain
+    if (licenseUrl) {
+      try {
+        const licenseOrigin = new URL(licenseUrl).origin;
+        const ses = session.fromPartition('persist:browse');
+        const cookies = await ses.cookies.get({ url: licenseOrigin });
+        if (cookies.length > 0 && !licenseHeaders['Cookie']) {
+          licenseHeaders['Cookie'] = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        }
+      } catch (_) {}
     }
 
     if (!licenseUrl) {
@@ -265,13 +302,13 @@ class Downloader {
 
     // Step 4: Get decryption key
     this._sendProgress(id, { status: 'downloading', url, savePath, percent: null, tool: 'drm', step: 'Getting decryption key...' });
-    const keyInfo = await this.drmHandler.getDecryptionKey(pssh, licenseUrl, headers);
-    console.log(`DRM key obtained via ${keyInfo.method}: ${keyInfo.decryptionKey}`);
+    const keyInfo = await this.drmHandler.getDecryptionKey(pssh, licenseUrl, licenseHeaders);
+    console.log(`[DRM] Keys obtained via ${keyInfo.method}: ${keyInfo.decryptionKeys.join(', ')}`);
 
     // Step 5: Download and decrypt
     await this.drmHandler.downloadAndDecrypt({
       mpdUrl,
-      decryptionKey: keyInfo.decryptionKey,
+      decryptionKeys: keyInfo.decryptionKeys,
       headers,
       savePath,
       onProgress: ({ step, percent, timeStr }) => {

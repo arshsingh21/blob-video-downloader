@@ -152,6 +152,13 @@ body {
   margin-bottom: 6px;
 }
 
+.stream-label {
+  font-size: 0.7rem;
+  color: #5aff8a;
+  margin-bottom: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
 .stream-url {
   font-size: 0.75rem;
   color: #aaa;
@@ -205,6 +212,19 @@ body {
   color: #fff;
 }
 .btn-download:hover { background: #4a4ae8; }
+
+.btn-locate {
+  background: #1a2a1a;
+  color: #5aff8a;
+  border: 1px solid #2a4a2a;
+}
+.btn-locate:hover { background: #223322; border-color: #5aff8a; }
+.btn-locate.active {
+  background: #1e3d1e;
+  color: #5aff8a;
+  border-color: #5aff8a;
+  box-shadow: 0 0 6px rgba(90,255,138,0.3);
+}
 
 .btn-copy-url {
   background: #2a2a38;
@@ -275,6 +295,41 @@ body {
   0% { transform: translateX(-100%); }
   100% { transform: translateX(400%); }
 }
+
+#download-settings-section {
+  padding: 10px 12px;
+  border-bottom: 1px solid #1e1e2a;
+}
+#download-settings-section h3 {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #555;
+  margin: 0 0 6px;
+}
+.download-dir-display {
+  font-size: 0.72rem;
+  color: #888;
+  background: #0f0f18;
+  border: 1px solid #1e1e2e;
+  border-radius: 4px;
+  padding: 5px 8px;
+  word-break: break-all;
+  cursor: default;
+}
+
+.btn-show-folder {
+  margin-top: 6px;
+  padding: 3px 10px;
+  font-size: 0.75rem;
+  background: #1a1a28;
+  color: #888;
+  border: 1px solid #2a2a3a;
+  border-radius: 4px;
+  cursor: pointer;
+  width: 100%;
+}
+.btn-show-folder:hover { background: #222233; color: #bbb; border-color: #444; }
 
 .btn-cancel {
   background: none;

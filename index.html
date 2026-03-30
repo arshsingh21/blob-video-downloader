@@ -59,6 +59,21 @@
       <p class="drm-help">Set your Widevine L3 CDM directory for local DRM decryption. Without CDM files, an external service will be used as fallback.</p>
     </div>
 
+    <div id="download-settings-section">
+      <h3>Download Settings</h3>
+      <p class="drm-help">DRM videos save here automatically — no dialog.</p>
+      <div id="download-dir-display" class="download-dir-display" title="">—</div>
+      <div style="display:flex;gap:6px;margin-top:6px;">
+        <button id="btn-pick-download-dir" class="btn-cdm" style="flex:1">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+          Change Folder
+        </button>
+        <button id="btn-open-download-dir" class="btn-cdm" style="flex:0 0 auto;padding:0 10px" title="Open in Explorer">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        </button>
+      </div>
+    </div>
+
     <div id="downloads-header">
       <h2>Downloads</h2>
     </div>
